@@ -1,0 +1,72 @@
+name: Import project assets
+on:
+  push:
+    branches: [main]
+    paths: ['.codex-upload/READY']
+permissions:
+  contents: write
+jobs:
+  import:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Restore and verify project assets
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          UPLOAD_REPOSITORY: ${{ github.repository }}
+          UPLOAD_COMMIT: ${{ github.sha }}
+        run: |
+          python3 - <<'PY'
+          import base64, hashlib, io, json, os, pathlib, shutil, subprocess, tarfile
+          env = os.environ.copy()
+          env["GIT_CONFIG_COUNT"] = "1"
+          env["GIT_CONFIG_KEY_0"] = "http.https://github.com/.extraheader"
+          env["GIT_CONFIG_VALUE_0"] = "AUTHORIZATION: basic " + base64.b64encode(("x-access-token:" + env["GITHUB_TOKEN"]).encode()).decode()
+          def git(*args):
+              return subprocess.check_output(["git", *args], env=env, text=True).strip()
+          git("init", "project")
+          os.chdir("project")
+          git("remote", "add", "origin", "https://github.com/" + env["UPLOAD_REPOSITORY"] + ".git")
+          git("fetch", "--depth=1", "origin", env["UPLOAD_COMMIT"])
+          git("checkout", "-B", "main", "FETCH_HEAD")
+          staging = pathlib.Path(".codex-upload")
+          manifest = json.loads((staging / "manifest.json").read_text())
+          archive = bytearray()
+          for part in manifest["parts"]:
+              data = (staging / part["name"]).read_bytes()
+              digest = hashlib.sha1(b"blob " + str(len(data)).encode() + b"\0" + data).hexdigest()
+              if digest != part["sha"]:
+                  raise RuntimeError("Upload chunk checksum mismatch: " + part["name"])
+              archive.extend(data)
+          expected = {entry["path"]: entry for entry in manifest["files"]}
+          seen = set()
+          with tarfile.open(fileobj=io.BytesIO(archive), mode="r:gz") as tar:
+              for member in tar:
+                  if not member.isfile() or member.name not in expected or member.name in seen:
+                      raise RuntimeError("Unexpected archive entry")
+                  spec = expected[member.name]
+                  path = pathlib.Path(member.name)
+                  if path.is_absolute() or ".." in path.parts:
+                      raise RuntimeError("Invalid archive path")
+                  data = tar.extractfile(member).read()
+                  digest = hashlib.sha1(b"blob " + str(len(data)).encode() + b"\0" + data).hexdigest()
+                  if len(data) != spec["size"] or digest != spec["sha"]:
+                      raise RuntimeError("Restored file checksum mismatch: " + member.name)
+                  path.parent.mkdir(parents=True, exist_ok=True)
+                  path.write_bytes(data)
+                  path.chmod(int(spec["mode"], 8) & 0o777)
+                  seen.add(member.name)
+          if seen != set(expected):
+              raise RuntimeError("Archive is missing required files")
+          shutil.rmtree(staging)
+          pathlib.Path(".github/workflows/codex-import-assets.yml").unlink()
+          git("add", "-A")
+          tree = git("write-tree")
+          if tree != manifest["tree_sha"]:
+              raise RuntimeError("Project tree mismatch: " + tree)
+          git("config", "user.name", "github-actions[bot]")
+          git("config", "user.email", "github-actions[bot]@users.noreply.github.com")
+          git("commit", "-m", "Restore complete project assets and remove temporary upload files")
+          git("push", "origin", "HEAD:main")
+          print("Complete project restored and verified: " + tree)
+          PY
